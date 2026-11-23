@@ -8,17 +8,17 @@
 // Audio: ALSA is resolved at runtime (dlopen("libasound.so.2")) so the
 // static binary carries no link-time ALSA dependency. If ALSA cannot
 // be opened, the game runs silent.
-// Input: the md-gpio-keys event device (grabbed, so the firmware does
-// not also act on the presses) plus a datagram socket at
-// /tmp/q2-atari.input.sock, where the firmware sends wheel ('w'),
-// key ('k') and touch ('t') events as short text lines.
+// Input: a datagram socket at /tmp/q2-atari.input.sock, where the
+// firmware sends wheel ('w'), key ('k') and touch ('t') events as
+// short text lines. The game deliberately does NOT open or grab the
+// md-gpio-keys device: an EVIOCGRAB would stop the firmware seeing
+// the presses, so it would never send the datagrams at all.
 #include "platform.h"
 
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
-#include <linux/input.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +32,7 @@
 
 #define INPUT_SOCKET "/tmp/q2-atari.input.sock"
 
-static int fb = -1, keys = -1, sock = -1, back, stride, original_y;
+static int fb = -1, sock = -1, back, stride, original_y;
 static int stop_pipe[2] = { -1, -1 };
 static volatile sig_atomic_t signal_writer = -1;
 static struct fb_var_screeninfo video;
@@ -41,7 +41,6 @@ static uint32_t *map;
 static uint32_t canvas[Q2_WIDTH * Q2_HEIGHT];
 
 volatile sig_atomic_t q2_quitting;
-int q2_raw_buttons;
 
 uint64_t clock_ns(void) {
     struct timespec now;
@@ -55,22 +54,6 @@ static void request_quit(int sig) {
     q2_quitting = 1;
     if (signal_writer >= 0) (void)write(signal_writer, "q", 1);
     errno = saved_errno;
-}
-
-static void grab_buttons(void) {
-    for (int i = 0; i < 32; ++i) {
-        char path[48], name[80] = { 0 };
-        snprintf(path, sizeof path, "/dev/input/event%d", i);
-        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) continue;
-        if (ioctl(fd, EVIOCGNAME(sizeof name), name) >= 0 &&
-            !strcmp(name, "md-gpio-keys") && ioctl(fd, EVIOCGRAB, 1) == 0) {
-            keys = fd;
-            q2_raw_buttons = 1;
-            return;
-        }
-        close(fd);
-    }
 }
 
 // --- ALSA, resolved at runtime -------------------------------------------
@@ -97,13 +80,16 @@ static void open_audio(void) {
     if (!alsa_handle) {
         alsa_handle = dlopen("libasound.so.2", RTLD_NOW | RTLD_LOCAL);
         if (!alsa_handle) return;
-        alsa_open = dlsym(alsa_handle, "snd_pcm_open");
-        alsa_set_params = dlsym(alsa_handle, "snd_pcm_set_params");
-        alsa_writei = dlsym(alsa_handle, "snd_pcm_writei");
-        alsa_close = dlsym(alsa_handle, "snd_pcm_close");
-        alsa_drop = dlsym(alsa_handle, "snd_pcm_drop");
-        alsa_prepare = dlsym(alsa_handle, "snd_pcm_prepare");
-        alsa_recover = dlsym(alsa_handle, "snd_pcm_recover");
+        // C-style casts: platform.c is also compiled with the C++
+        // compiler by build.sh / CI (g++ treats .c as C++), where a
+        // void* does not implicitly convert to a function pointer.
+        alsa_open = (int (*)(snd_pcm_t **, const char *, int, int))dlsym(alsa_handle, "snd_pcm_open");
+        alsa_set_params = (int (*)(snd_pcm_t *, int, int, unsigned, unsigned, int, unsigned))dlsym(alsa_handle, "snd_pcm_set_params");
+        alsa_writei = (long (*)(snd_pcm_t *, const void *, unsigned long))dlsym(alsa_handle, "snd_pcm_writei");
+        alsa_close = (int (*)(snd_pcm_t *))dlsym(alsa_handle, "snd_pcm_close");
+        alsa_drop = (int (*)(snd_pcm_t *))dlsym(alsa_handle, "snd_pcm_drop");
+        alsa_prepare = (int (*)(snd_pcm_t *))dlsym(alsa_handle, "snd_pcm_prepare");
+        alsa_recover = (int (*)(snd_pcm_t *, int, int))dlsym(alsa_handle, "snd_pcm_recover");
         if (!alsa_open || !alsa_set_params || !alsa_writei || !alsa_close ||
             !alsa_drop || !alsa_prepare || !alsa_recover) {
             dlclose(alsa_handle);
@@ -200,7 +186,7 @@ int platform_open(void) {
         video.blue.offset != 0 || stride < Q2_HEIGHT ||
         (size_t)2 * Q2_WIDTH * stride * 4 > fixed.smem_len) return 0;
     map_size = fixed.smem_len;
-    map = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0);
+    map = (uint32_t *)mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0);
     if (map == MAP_FAILED) { map = NULL; return 0; }
 
     struct sockaddr_un address = { .sun_family = AF_UNIX, .sun_path = INPUT_SOCKET };
@@ -210,9 +196,8 @@ int platform_open(void) {
     if (bind(sock, (struct sockaddr *)&address, sizeof address)) return 0;
 
     open_audio();
-    grab_buttons();
-    fprintf(stderr, "q2-atari: ALSA=%s GPIO=%s\n", pcm ? "open" : "unavailable",
-            q2_raw_buttons ? "grabbed" : "using firmware fallback");
+    fprintf(stderr, "q2-atari: ALSA=%s (input via firmware socket)\n",
+            pcm ? "open" : "unavailable");
     return 1;
 }
 
@@ -234,17 +219,6 @@ void platform_present(void) {
 }
 
 int platform_event(Q2Event *e) {
-    struct input_event key;
-    if (keys >= 0 && read(keys, &key, sizeof key) == sizeof key) {
-        if (key.type == EV_SYN && key.code == SYN_DROPPED) {
-            *e = (Q2Event){ 'r', 0, 0, 0 };
-        } else if (key.type == EV_KEY && key.value <= 1) {
-            *e = (Q2Event){ 'g', key.value ? 'd' : 'u', key.code, 0 };
-        } else {
-            *e = (Q2Event){ 0 };
-        }
-        return 1;
-    }
     char buffer[80];
     ssize_t n = sock < 0 ? -1 : recv(sock, buffer, sizeof buffer - 1, MSG_DONTWAIT);
     if (n < 1) return 0;
@@ -256,13 +230,14 @@ int platform_event(Q2Event *e) {
                sscanf(buffer + 1, " %c %d %d", &e->action, &e->x, &e->y) >= 2) {
         e->kind = buffer[0];
     }
+    // Anything else (e.g. 'v' volume answers) is ignored.
     return 1;
 }
 
 void platform_wait(uint64_t deadline_ns) {
     if (q2_quitting) return;
     struct pollfd input[] = {
-        { keys, POLLIN, 0 }, { sock, POLLIN, 0 }, { stop_pipe[0], POLLIN, 0 },
+        { sock, POLLIN, 0 }, { stop_pipe[0], POLLIN, 0 },
     };
     struct timespec timeout, *limit = NULL;
     if (deadline_ns != UINT64_MAX) {
@@ -279,8 +254,6 @@ void platform_wait(uint64_t deadline_ns) {
 void platform_close(void) {
     if (pcm) { alsa_drop(pcm); alsa_close(pcm); pcm = NULL; }
     if (alsa_handle) { dlclose(alsa_handle); alsa_handle = NULL; }
-    if (keys >= 0) close(keys);
-    keys = -1;
     if (sock >= 0) { close(sock); unlink(INPUT_SOCKET); }
     sock = -1;
     if (stop_pipe[1] >= 0) {

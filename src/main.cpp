@@ -42,10 +42,11 @@ extern uInt16 mySoundFreq;
 #define A26_WIDTH 160
 #define A26_MAX_HEIGHT 262
 
-// Scratch RGB565 buffer for the core's direct DS framebuffer pointer.
-// 160x262 u16. The core may write here; the frontend reads it back
-// only if the indexed framebuffer turns out empty (see pick_frame).
-static uInt16 ds_scratch[A26_WIDTH * A26_MAX_HEIGHT];
+// The core's direct DS framebuffer lives in the Q2 shim
+// (q2_ds_framebuffer, see q2shim.h): the TIA writes every scanline
+// there through BG_GFX, and the frontend reads it back only if the
+// indexed framebuffer turns out empty (see pick_frame). It is set by
+// the TIA itself on reset, so the frontend only needs it to exist.
 
 // ---------------------------------------------------------------------------
 // Tiny 5x7 font (uppercase, digits, a little punctuation) for the picker.
@@ -185,6 +186,35 @@ static void fill_rect(uint32_t *cv, int x, int y, int w, int h, uint32_t color) 
         uint32_t *dst = cv + (y + row) * Q2_WIDTH + x;
         for (int i = 0; i < w; ++i) dst[i] = color;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Explicit .init_array runner.
+//
+// The Q2 firmware's ld.so (glibc 2.28) does not run the main
+// executable's DT_INIT_ARRAY — verified under qemu-mipsel with both a
+// C __attribute__((constructor)) test and a C++ global-constructor
+// test: the constructor never fires, while a shared library's
+// constructor in the same process does. (A newer ld.so, e.g. Ubuntu's
+// 2.39, runs it, which is why the host build works.) Without this,
+// the core's globals (theTIA, theM6532, myStellaEvent, ...) are never
+// constructed: TIA::reset() then dereferences the null
+// myCurrentFrameBuffer and segfaults in the Console constructor.
+// Running the array here, at the start of main(), fixes it on any
+// loader. The guard keeps a loader that does run the array from
+// double-constructing: TIA's constructor sets myCurrentFrameBuffer[0],
+// so a non-null pointer means the array already ran.
+// ---------------------------------------------------------------------------
+extern "C" {
+extern void (*__init_array_start[])(void);
+extern void (*__init_array_end[])(void);
+}
+
+static void run_init_array_once(void) {
+    if (myCurrentFrameBuffer[0] != nullptr) return;  // loader ran it
+    for (void (**p)(void) = __init_array_start; p < __init_array_end; ++p)
+        if (*p) (*p)();
+    fprintf(stderr, "q2-atari: ran .init_array manually (ld.so skipped it)\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -349,24 +379,58 @@ static void blit_frame(uint32_t *cv) {
 }
 
 // ---------------------------------------------------------------------------
-// Audio: drain TIASound's sample buffer into ALSA each frame.
+// Audio: drive the TIA sound generator and drain its samples into
+// ALSA each frame. The DS drove Tia_process() with a TIMER2 interrupt
+// at the sample rate; the Q2 frame loop drives it here instead — one
+// call makes exactly one sample, so a frame needs rate/fps of them.
+// Non-WAVE samples land in *aptr/*bptr (shim slots, read after each
+// call); WAVE samples land in the tia_buf ring, drained below.
 // TIASound produces unsigned 16-bit samples centred on 32768; convert
 // to signed and duplicate to stereo. (If the audio sounds wrong on
 // device, this conversion is the first thing to revisit.)
 // ---------------------------------------------------------------------------
+static unsigned gen_audio(int16_t *out, unsigned frames) {
+    unsigned n = 0;
+    if (myCartInfo.soundQuality == SOUND_WAVE) {
+        for (unsigned i = 0; i < frames; ++i) Tia_process();
+        // Drain the tia_buf ring, advancing the read position so the
+        // producer never sees a full buffer (it spins waiting for the
+        // drain when full). The ring holds SOUND_SIZE entries.
+        unsigned avail =
+            (unsigned)((tia_buf_idx - tia_out_idx) & (SOUND_SIZE - 1));
+        if (avail > frames) avail = frames;
+        for (unsigned i = 0; i < avail; ++i) {
+            int16_t s = (int16_t)(tia_buf[tia_out_idx] ^ 0x8000u);
+            tia_out_idx = (uInt16)((tia_out_idx + 1) & (SOUND_SIZE - 1));
+            out[2 * n] = s;
+            out[2 * n + 1] = s;
+            ++n;
+        }
+    } else {
+        for (unsigned i = 0; i < frames; ++i) {
+            Tia_process();
+            int16_t s = (int16_t)(*aptr ^ 0x8000u);
+            out[2 * n] = s;
+            out[2 * n + 1] = s;
+            ++n;
+        }
+    }
+    return n;
+}
+
 static void pump_audio(void) {
     if (!platform_audio_available()) return;
-    unsigned available = tia_buf_idx;
-    if (available == 0 || !tia_buf) return;
-    if (available > 4096) available = 4096;
+    unsigned rate = mySoundFreq ? mySoundFreq : 20933;
+    unsigned fps = myCartInfo.tv_type == PAL ? 50 : 60;
+    static unsigned audio_acc = 0;
+    audio_acc += rate;
+    unsigned want = audio_acc / fps;
+    audio_acc %= fps;
+    if (want == 0) return;
+    if (want > 4096) want = 4096;
     static int16_t stereo[4096 * 2];
-    for (unsigned i = 0; i < available; ++i) {
-        int16_t s = (int16_t)(tia_buf[i] ^ 0x8000u);
-        stereo[2 * i] = s;
-        stereo[2 * i + 1] = s;
-    }
-    tia_buf_idx = 0;
-    platform_audio_write(stereo, available);
+    unsigned got = gen_audio(stereo, want);
+    if (got) platform_audio_write(stereo, got);
 }
 
 // ---------------------------------------------------------------------------
@@ -401,65 +465,79 @@ static void pulse_switch(Console *console, Event::Type type) {
     myStellaEvent.set(type, 0);
 }
 
-// Linux input key codes for the Q2's physical buttons. These are the
-// standard codes; the exact mapping is confirmed from the emulator's
-// demo.log (every GPIO event is logged there) on first device test.
-#define KEY_ESC 1
-#define KEY_ENTER 28
-#define KEY_SPACE 57
-#define KEY_LEFT 105
-#define KEY_RIGHT 106
-#define KEY_UP 103
-#define KEY_DOWN 108
-#define KEY_BACKSPACE 14
-#define KEY_PLAYPAUSE 164
+// Firmware datagram key codes (AWTK, q2-pod patch/addon.c): the
+// firmware sends "k d CODE" / "k u CODE" on the input socket. Return
+// 170, Centre 218, Play 171, Prev/Next side buttons 222/223 (172/173
+// are the same buttons on older firmware, per q2-pico8). There is no
+// direct GPIO input: the game must not grab md-gpio-keys, or the
+// firmware never sends these datagrams.
+#define FW_KEY_RETURN 170
+#define FW_KEY_PLAY 171
+#define FW_KEY_PREV 222
+#define FW_KEY_PREV_OLD 172
+#define FW_KEY_NEXT 223
+#define FW_KEY_NEXT_OLD 173
+#define FW_KEY_CENTRE 218
+
+// One wheel tick is 28 units of the firmware's raw travel (200 per
+// turn, rising anticlockwise) at the default 50% Controls
+// sensitivity, the same conversion q2-utilities uses.
+#define WHEEL_UNITS_PER_TICK 28
 
 // Drain platform events. Returns: 0 keep playing, 1 exit to picker,
 // 2 quit the app. Pulses (select/reset/etc.) are applied immediately.
 // Held directions/fire are written into *held. One-frame pulses
-// (wheel ticks and firmware key presses, which carry no release) are
-// reported in *pulse as a bitmask: 1 up, 2 down, 4 left, 8 right,
-// 16 fire. The caller applies them around console->update().
+// (wheel ticks) are reported in *pulse as a bitmask: 1 up, 2 down,
+// 4 left, 8 right, 16 fire. The caller applies them around
+// console->update().
 static int drain_events(Console *console, Held *held, unsigned *pulse) {
     Q2Event e;
     while (platform_event(&e)) {
-        if (e.kind == 'g') {
+        if (e.kind == 'w') {
+            // Raw travel arrives once per firmware UI loop pass and
+            // can span several ticks; accumulate and emit one pulse
+            // per tick (at most one per direction per frame — the
+            // remainder stays queued for the next frame).
+            static int wheel_acc = 0;
+            wheel_acc += e.x;
+            while (wheel_acc >= WHEEL_UNITS_PER_TICK) {
+                *pulse |= 2u;
+                wheel_acc -= WHEEL_UNITS_PER_TICK;
+            }
+            while (wheel_acc <= -WHEEL_UNITS_PER_TICK) {
+                *pulse |= 1u;
+                wheel_acc += WHEEL_UNITS_PER_TICK;
+            }
+        } else if (e.kind == 'k') {
             bool down = e.action == 'd';
-            fprintf(stderr, "q2-atari: gpio key code=%d %s\n", e.x,
+            fprintf(stderr, "q2-atari: firmware key %d %s\n", e.x,
                     down ? "down" : "up");
             switch (e.x) {
-            case KEY_UP: held->up = down; break;
-            case KEY_DOWN: held->down = down; break;
-            case KEY_LEFT: held->left = down; break;
-            case KEY_RIGHT: held->right = down; break;
-            case KEY_ENTER: case KEY_SPACE: held->fire = down; break;
-            case KEY_PLAYPAUSE:
+            case FW_KEY_CENTRE:
+                held->fire = down;
+                break;
+            case FW_KEY_PREV: case FW_KEY_PREV_OLD:
+                held->left = down;
+                break;
+            case FW_KEY_NEXT: case FW_KEY_NEXT_OLD:
+                held->right = down;
+                break;
+            case FW_KEY_PLAY:
                 if (down) pulse_switch(console, Event::ConsoleSelect);
                 break;
-            case KEY_ESC: case KEY_BACKSPACE:
+            case FW_KEY_RETURN:
+                // Exit on the press, before the firmware TERMs the
+                // game for holding Return; its release is eaten by
+                // the firmware, so the picker never sees it.
                 if (down) return 1;
                 break;
-            default: break;
+            default:
+                break;
             }
-        } else if (e.kind == 'w') {
-            // Each wheel tick is a one-frame directional pulse.
-            *pulse |= e.x > 0 ? 2u : 1u;
-        } else if (e.kind == 'k') {
-            fprintf(stderr, "q2-atari: firmware key '%c' %d %d\n",
-                    e.action, e.x, e.y);
-            switch (e.action) {
-            case 'u': *pulse |= 1u; break;
-            case 'd': *pulse |= 2u; break;
-            case 'l': *pulse |= 4u; break;
-            case 'r': *pulse |= 8u; break;
-            case 'f': case 'a': case 'c': *pulse |= 16u; break;
-            case 's': pulse_switch(console, Event::ConsoleSelect); break;
-            case 'e': pulse_switch(console, Event::ConsoleReset); break;
-            case 'q': return 2;
-            default: break;
-            }
-        } else if (e.kind == 't') {
-            // Bottom touch strip: four console-switch zones.
+        } else if (e.kind == 't' && e.action == 'd') {
+            // Touch down only: a move or lift across the strip must
+            // not re-trigger the switch. Bottom touch strip: four
+            // console-switch zones.
             if (e.y >= 280) {
                 int zone = e.x / (Q2_WIDTH / 4);
                 if (zone == 0) pulse_switch(console, Event::ConsoleSelect);
@@ -476,8 +554,6 @@ static int drain_events(Console *console, Held *held, unsigned *pulse) {
                     myStellaEvent.set(Event::ConsoleLeftDifficultyB, diff_a ? 0 : 1);
                 }
             }
-        } else if (e.kind == 'r') {
-            return 1;  // input resync after a dropped event burst
         }
     }
     return 0;
@@ -535,29 +611,31 @@ static int run_picker(char *out_path, size_t out_size) {
             platform_wait(UINT64_MAX);
             continue;
         }
-        if (e.kind == 'g' && e.action == 'd') {
-            if (e.x == KEY_UP && selected > 0) --selected;
-            else if (e.x == KEY_DOWN && selected < rom_count - 1) ++selected;
-            else if (e.x == KEY_ENTER && rom_count > 0) {
-                snprintf(out_path, out_size, "%s/%s", dir, rom_names[selected]);
-                return 1;
-            } else if (e.x == KEY_ESC || e.x == KEY_BACKSPACE) {
-                return 0;
-            }
-        } else if (e.kind == 'w' && rom_count > 0) {
-            selected += e.x > 0 ? 1 : -1;
+        if (e.kind == 'w' && rom_count > 0) {
+            // Raw wheel travel: one tick per 28 units (see
+            // WHEEL_UNITS_PER_TICK); a fast spin can move several
+            // rows at once.
+            static int wheel_acc = 0;
+            wheel_acc += e.x;
+            int ticks = wheel_acc / WHEEL_UNITS_PER_TICK;
+            wheel_acc -= ticks * WHEEL_UNITS_PER_TICK;
+            selected += ticks;
             if (selected < 0) selected = 0;
             if (selected > rom_count - 1) selected = rom_count - 1;
-        } else if (e.kind == 'k') {
-            if (e.action == 'u' && selected > 0) --selected;
-            else if (e.action == 'd' && selected < rom_count - 1) ++selected;
-            else if ((e.action == 'c' || e.action == 'f') && rom_count > 0) {
+        } else if (e.kind == 'k' && e.action == 'd') {
+            if ((e.x == FW_KEY_CENTRE || e.x == FW_KEY_PLAY) && rom_count > 0) {
                 snprintf(out_path, out_size, "%s/%s", dir, rom_names[selected]);
                 return 1;
-            } else if (e.action == 'q') {
+            } else if (e.x == FW_KEY_RETURN) {
                 return 0;
+            } else if ((e.x == FW_KEY_PREV || e.x == FW_KEY_PREV_OLD) &&
+                       selected > 0) {
+                --selected;
+            } else if ((e.x == FW_KEY_NEXT || e.x == FW_KEY_NEXT_OLD) &&
+                       selected < rom_count - 1) {
+                ++selected;
             }
-        } else if (e.kind == 't' && rom_count > 0) {
+        } else if (e.kind == 't' && e.action == 'd' && rom_count > 0) {
             // Tap a row to select it; tap the selected row to launch.
             int row = (e.y - 52) / 14;
             if (row >= 0 && top + row < rom_count) {
@@ -567,8 +645,6 @@ static int run_picker(char *out_path, size_t out_size) {
                 }
                 selected = top + row;
             }
-        } else if (e.kind == 'r') {
-            continue;
         }
         int rows = (Q2_HEIGHT - 60) / 14;
         if (selected < top) top = selected;
@@ -590,9 +666,18 @@ static int run_game(const char *rom_path) {
         return 0;
     }
     q2shim_defaults_for_rom(rom_path);
-    // Point the core's direct DS framebuffer at a scratch buffer so it
-    // never writes through a null pointer.
-    myDSFramePointer = ds_scratch;
+    // The TIA resets myDSFramePointer to BG_GFX (the shim buffer)
+    // during Console construction; point it there first so it is
+    // never null in between.
+    myDSFramePointer = q2_ds_framebuffer;
+    // The core's sound buffers live at fixed DS VRAM addresses; map
+    // real RAM there before the Console constructor runs
+    // Tia_sound_init(), or it segfaults writing to unmapped memory.
+    if (!q2shim_map_ds_ram()) {
+        fprintf(stderr, "q2-atari: cannot map DS sound RAM\n");
+        free(rom);
+        return 0;
+    }
 
     Console *console = new Console(rom, rom_size, rom_path);
     fprintf(stderr, "q2-atari: loaded %s (%u bytes), cart %s\n", rom_path,
@@ -636,6 +721,8 @@ static int run_game(const char *rom_path) {
         if (pulse & 8u) myStellaEvent.set(Event::JoystickZeroRight, held.right ? 1 : 0);
         if (pulse & 16u) myStellaEvent.set(Event::JoystickZeroFire, held.fire ? 1 : 0);
 
+        ++gAtariFrames;
+        ++gTotalAtariFrames;
         pump_audio();
         blit_frame(cv);
         platform_present();
@@ -678,12 +765,31 @@ static int run_smoke(const char *rom_path, const char *prefix, int frames) {
         return 1;
     }
     q2shim_defaults_for_rom(rom_path);
-    myDSFramePointer = ds_scratch;
+    myDSFramePointer = q2_ds_framebuffer;
+    if (!q2shim_map_ds_ram()) {
+        printf("SMOKE_FAIL cannot map DS sound RAM\n");
+        free(rom);
+        return 1;
+    }
     Console *console = new Console(rom, rom_size, rom_path);
     printf("SMOKE cart=%s size=%u tv=%s\n",
            console->myCartridge ? console->myCartridge->name() : "?",
            rom_size, myCartInfo.tv_type == PAL ? "PAL" : "NTSC");
-    for (int i = 0; i < frames; ++i) console->update();
+    for (int i = 0; i < frames; ++i) {
+        console->update();
+        ++gAtariFrames;
+        ++gTotalAtariFrames;
+    }
+
+    // Audio probe: drive one frame's worth of samples to prove the
+    // TIA sound path runs (the DS drove it with a TIMER2 interrupt;
+    // the Q2 frame loop drives it). The test ROM never touches the
+    // audio registers, so the samples are silence — the check is that
+    // generation runs without crashing and returns the count.
+    static int16_t probe[512 * 2];
+    unsigned audio_got = gen_audio(probe, 349);
+    printf("SMOKE audio samples=%u tia_buf_idx=%u\n", audio_got,
+           (unsigned)tia_buf_idx);
 
     int height = (int)theTIA.height();
     if (height < 1) height = 192;
@@ -713,7 +819,7 @@ static int run_smoke(const char *rom_path, const char *prefix, int frames) {
     }
     uint32_t max_ds = 0;
     for (int i = 0; i < A26_WIDTH * height; ++i) {
-        uint16_t p = ds_scratch[i];
+        uint16_t p = q2_ds_framebuffer[i];
         uint32_t r = (p >> 11) & 0x1F, g = (p >> 5) & 0x3F, b = p & 0x1F;
         uint8_t v = (uint8_t)(((r << 3) * 77 + (g << 2) * 150 + (b << 3) * 29) >> 8);
         px[i] = v;
@@ -735,6 +841,10 @@ static int run_smoke(const char *rom_path, const char *prefix, int frames) {
 
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
+    // The core's globals need their constructors before anything
+    // else runs (see run_init_array_once above).
+    run_init_array_once();
+
     if (argc >= 2 && strcmp(argv[1], "--smoke") == 0) {
         if (argc < 4) {
             fprintf(stderr, "usage: %s --smoke <rom> <outprefix> [frames]\n",

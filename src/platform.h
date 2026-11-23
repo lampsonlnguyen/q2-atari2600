@@ -5,9 +5,11 @@
 // 320x375, so presenting rotates the canvas 90 degrees into the
 // framebuffer's back page and flips it in with FBIOPAN_DISPLAY.
 // Audio goes through ALSA, loaded at runtime with dlopen so the binary
-// does not need the firmware's libasound at link time. Input comes from
-// the Q2's GPIO buttons (md-gpio-keys) and from the Unix socket the
-// firmware feeds with wheel and touch events.
+// does not need the firmware's libasound at link time. Input comes
+// only from the Unix socket the firmware feeds with wheel, key and
+// touch datagrams (/tmp/q2-atari.input.sock): the game must NOT grab
+// the md-gpio-keys device, or the firmware stops seeing the presses
+// and never sends the datagrams (q2-pico8 works the same way).
 #ifndef Q2ATARI_PLATFORM_H
 #define Q2ATARI_PLATFORM_H
 
@@ -21,15 +23,15 @@
 extern "C" {
 #endif
 
-// One input event. kind 'g' is a GPIO key (action 'd' down / 'u' up,
-// x holds the Linux key code). kind 'w' is a wheel turn (x is the
-// signed tick count, positive is down). kind 'k' is a firmware key
-// (action is the firmware's key character). kind 't' is a touch
-// (x, y are screen coordinates).
+// One input event. kind 'w' is a wheel turn (x is the firmware's raw
+// travel, 200 per turn, rising anticlockwise). kind 'k' is a firmware
+// key (action 'd' down / 'u' up, x holds the AWTK key code: Return
+// 170, Centre 218, Play 171, Prev/Next side buttons 222/223). kind
+// 't' is a touch (action 'd' down / 'm' move / 'u' up, x, y are
+// screen coordinates in the 375x320 landscape view).
 typedef struct { char kind, action; int x, y; } Q2Event;
 
 extern volatile sig_atomic_t q2_quitting;
-extern int q2_raw_buttons;
 
 int platform_open(void);
 void platform_close(void);
