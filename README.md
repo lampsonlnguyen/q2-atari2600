@@ -53,23 +53,38 @@ The StellaDS core is a stripped Stella 2.8.4 core whose frontend was the
 Nintendo DS. The Q2 port keeps only `arm9/source/emucore/` and replaces the
 rest:
 
-- `src/main.c` — ROM picker, frame loop, scaling blit, audio pump, input.
+- `src/main.cpp` — ROM picker, frame loop, scaling blit, audio pump, input.
   It drives the core through its public surface: `Console(image, size,
   filename)` + `Console::update()` once per frame, `myStellaEvent.set(...)`
   for joystick/console-switch input, the TIA's indexed framebuffer +
   palette for video, and TIASound's sample buffer for audio.
 - `src/platform.c` / `src/platform.h` — Q2 platform layer: `/dev/fb0`
   framebuffer (375×320), ALSA audio (loaded at runtime with `dlopen`, so
-  the binary stays static-friendly), GPIO buttons, and the firmware's input
-  socket.
+  the binary stays static-friendly), and the firmware's input socket
+  only — the game must not grab the GPIO buttons (see Input below).
 - `src/q2shim.cpp` — the handful of globals the core expects its frontend
-  to provide: `myCartInfo` / `myGlobalCartInfo` (per-cart config, defaulted
-  to joystick + 20 kHz sound), `mySoundFreq`, `my_filename`, and a
-  `dsPrintCartType()` stub.
+  to provide: `mySoundFreq`, `my_filename`, the frame counters
+  (`gAtariFrames`, `gTotalAtariFrames`), SaveKey state, `tv_type_requested`,
+  `allConfigs` (zeroed: no saved per-cart configs, so the core falls
+  through to its internal database), the sound sample slots `aptr`/`bptr`,
+  the `debug` array, `dsPrintValue()` / `dsWarnIncompatibileCart()` stubs,
+  the DS framebuffer buffer `q2_ds_framebuffer`, and
+  `q2shim_map_ds_ram()`, which maps RAM at the DS VRAM addresses the
+  TIA sound code writes to. (`myCartInfo` / `myGlobalCartInfo` are defined
+  by the core itself, in `Cart.cpp`; the shim only fills them in per ROM.)
 - `src/compat/nds.h` — a minimal stub for the `<nds.h>` include the core
-  carries from its DS days. It provides nothing DS-specific; it only lets
-  the core compile without the DS SDK.
-- `src/build.sh` — local cross build (needs a Q2 sysroot; see below).
+  carries from its DS days. It provides the libnds typedefs
+  (`uint8`/`uint16`/`uint32`…), `ITCM_CODE` (empty), `isDSiMode()` (false:
+  DS-Lite path), and redirects the DS video hardware the TIA writes
+  through — `BG_GFX` becomes the shim's `q2_ds_framebuffer` buffer and
+  `dmaCopyWordsAsynch` becomes a `memcpy` — so the core never touches
+  unmapped DS VRAM addresses.
+- `src/compat/q2prefix.h` — forced via `-include` on every translation
+  unit: `<cstdint>`, `<cstring>` and `<sys/stat.h>`, which the core relied
+  on `<nds.h>` to pull in.
+- `src/compat/fat.h` — an empty stub for the libfat include in
+  `SaveKey.cpp` (it uses no libfat symbol).
+- `src/build.sh` — local cross build (no Q2 sysroot needed; see below).
 - `.github/workflows/build.yml` — the real build: Ubuntu 24.04 +
   `gcc-mipsel-linux-gnu`, NaN-2008 ABI probe, static MIPS ELF, QEMU smoke
   test, card-app ZIP artifact.
@@ -82,8 +97,41 @@ to fit and letterboxed (about 267×320 for a 160×192 NTSC frame).
 
 ### Audio
 
-TIASound produces samples at ~20,933 Hz into its sample buffer; the
-frontend drains it into ALSA each frame.
+On the DS, `Tia_process()` ran as a TIMER2 interrupt at the sample rate.
+The Q2 frame loop drives it instead: one call makes exactly one sample,
+so a frame runs it `rate/fps` times. Non-WAVE samples are read from
+`*aptr`/`*bptr` after each call; WAVE carts (some DPC+ and others) fill
+the `tia_buf` ring, which the frame loop drains (and advances
+`tia_out_idx` on, so the producer never sees a full ring). Samples are
+converted from unsigned to signed stereo and written to ALSA each frame.
+TIASound's samples are unipolar (0..~30720), so the `^ 0x8000` conversion
+leaves a DC offset — if the audio sounds wrong on device, that
+conversion is the first thing to revisit.
+
+### Input
+
+Input comes only from the firmware's datagram socket
+(`/tmp/q2-atari.input.sock`), the same protocol q2-pico8 uses — the game
+must NOT grab the `md-gpio-keys` device, or the firmware stops seeing
+the presses and never sends the datagrams. The firmware sends:
+
+- `k d CODE` / `k u CODE` — a key down/up, AWTK codes: Return 170,
+  Centre 218, Play 171, Prev/Next side buttons 222/223 (172/173 on
+  older firmware). Centre is fire (held), the side buttons are
+  joystick left/right (held), Play pulses Console Select, Return exits
+  to the picker (on the press, before the firmware TERMs the game for
+  holding Return). In the picker, Centre/Play launches, Return quits,
+  the side buttons move the selection.
+- `w N` — the wheel's raw travel since the last firmware UI loop pass
+  (200 per turn, rising anticlockwise). One tick is 28 units at the
+  default 50% Controls sensitivity; the frontend accumulates travel
+  and emits one one-frame joystick pulse per tick (up/down in a game,
+  one row per tick in the picker).
+- `t d X Y` / `t m X Y` / `t u X Y` — touch down/move/up in the 375×320
+  landscape view. Only the down acts: in a game, the bottom strip
+  (y ≥ 280) holds four console-switch zones — Select, Reset, Color/BW,
+  Difficulty A/B. In the picker, a tap selects a row; tapping the
+  selected row launches it.
 
 ### Frame pacing
 
@@ -99,7 +147,39 @@ Push to `feature/stellads-port` (or run the workflow manually). The
 runs the QEMU smoke test with a generated minimal test ROM, checks the ELF
 with `readelf`, and uploads `q2-atari2600-alpha.zip`.
 
-### Locally
+**CI cannot currently link:** Ubuntu 24.04's mipsel C runtime is
+legacy-NaN, so the workflow's NaN-2008 ABI probe fails at the link step
+(`linking -mnan=2008 module with previous -mnan=legacy modules`). The
+probe fails loudly on purpose — do not suppress it with
+`--no-warn-mismatch`. Until CI gains a real NaN-2008 sysroot/toolchain,
+use the local sysroot build below; it is the verified route.
+
+### Locally (sysroot build — the verified route)
+
+The Q2 firmware sysroot (`~/.cache/q2/sysroot`, glibc 2.28 NaN-2008)
+plus a Debian Buster GCC 8 root for the C++ headers/static libstdc++
+gives a dynamic MIPS binary that links against the libc the device
+actually runs. This is the q2-pico8 recipe:
+
+```sh
+git clone --depth 1 --branch 8.4a \
+  https://github.com/wavemotion-dave/StellaDS.git deps/StellaDS
+STELLADS=deps/StellaDS sh tools/build-mips-sysroot.sh build/q2-atari
+```
+
+`tools/build-mips-sysroot.sh` needs `Q2_SYSROOT` (default
+`~/.cache/q2/sysroot`) and `Q2_GCC8_ROOT` (the Buster GCC 8 root; see
+the script header). It asserts the result is a nan2008 MIPS32r2 ELF
+with the firmware's loader as PT_INTERP and no DT_NEEDED on ld.so
+(the q2-pico8 loader-crash pattern). Run the QEMU smoke test with:
+
+```sh
+python3 tools/make-test-rom.py build/test.a26
+qemu-mipsel -L "$Q2_SYSROOT" build/q2-atari --smoke \
+  build/test.a26 build/smoke 70
+```
+
+### Locally (static build — Ubuntu toolchain, currently unlinkable)
 
 You need `mipsel-linux-gnu-g++` (Ubuntu/Debian
 `g++-mipsel-linux-gnu`). No Q2 sysroot is needed: the binary is
@@ -130,14 +210,14 @@ binary and zip the `.atari` folder at the archive root.
 
 ## Known gaps (v1)
 
-- **Framebuffer source is not yet proven.** The core has two video paths:
-  the indexed framebuffer (`myCurrentFrameBuffer`) + palette, and a direct
-  16-bit DS framebuffer pointer (`myDSFramePointer`). The frontend reads the
-  indexed path; `--smoke` mode dumps both paths so the first CI run shows
-  which one the core actually fills. If the indexed path is empty, the
-  frontend switches to the DS pointer.
+- **Framebuffer source is proven.** The core fills both video paths: the
+  host smoke test on the generated test ROM gives max luminance 243 on
+  both indexed buffers and 146 on the DS pointer buffer, so the indexed
+  path is primary and the DS pointer is a working fallback. (Before the
+  fix, the TIA wrote the DS path through the DS VRAM address `0x06000000`,
+  which is unmapped on the Q2 — see `src/compat/nds.h`.)
 - **Paddles / driving / keypad / Genesis pad** are not mapped to Q2 input.
-  Paddle games will load but the paddle sits at one extreme.
+  Paddle games will load with the paddle parked mid-range.
 - **Save states** are not wired up yet (the core supports them; the Q2 UI
   for save/load slots is a follow-up).
 - **SaveKey / EEPROM** games: the core's SaveKey controller is installed
