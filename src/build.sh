@@ -31,6 +31,7 @@ test -d "$STELLADS/arm9/source/emucore" || {
 # sed before compiling instead.
 "$CXX_Q2" -march=mips32r2 -mabi=32 -mhard-float -mfp64 -mnan=2008 -mabs=2008 \
     -O2 -fno-rtti -fno-exceptions -static -no-pie \
+    -include "$root/src/compat/q2prefix.h" \
     -Isrc -I"$root/src/compat" \
     -I"$STELLADS/arm9/source/emucore" -I"$STELLADS/arm9/source" \
     -D_GNU_SOURCE -std=gnu++17 -Wall -Wextra \
