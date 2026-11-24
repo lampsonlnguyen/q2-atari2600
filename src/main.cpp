@@ -385,10 +385,49 @@ static void blit_frame(uint32_t *cv) {
 // call makes exactly one sample, so a frame needs rate/fps of them.
 // Non-WAVE samples land in *aptr/*bptr (shim slots, read after each
 // call); WAVE samples land in the tia_buf ring, drained below.
-// TIASound produces unsigned 16-bit samples centred on 32768; convert
-// to signed and duplicate to stereo. (If the audio sounds wrong on
-// device, this conversion is the first thing to revisit.)
-// ---------------------------------------------------------------------------
+//
+// DC fix (v0.2.0): TIASound's raw samples are UNIPOLAR, 0..3840
+// (Outvol[0]+Outvol[1], each 0..15, times 128 in sampleExtender).
+// Silence is raw 0. The old conversion `raw ^ 0x8000` turned silence
+// into a constant -32768 (full negative rail) with only 3840 counts
+// of variation on top — inaudible, and a huge DC offset into ALSA.
+// The correct conversion centres the signal: a slow DC tracker
+// (alpha 1/4096, ~200 ms) follows the signal mean, the deviation
+// from it is amplified x8 (max deviation 1920 * 8 = 15360..30720,
+// inside s16) and clamped. Silence stays exactly 0.
+static int32_t audio_dc = 0;
+static unsigned long audio_stat_count = 0;
+static long audio_stat_sum = 0;
+static int audio_stat_min = 0, audio_stat_max = 0;
+
+static int16_t audio_convert(uint16_t raw) {
+    audio_dc += ((int32_t)raw - audio_dc) >> 12;
+    int32_t v = ((int32_t)raw - audio_dc) * 8;
+    if (v > 32767) v = 32767;
+    else if (v < -32768) v = -32768;
+    int16_t s = (int16_t)v;
+    if (audio_stat_count == 0) { audio_stat_min = audio_stat_max = s; }
+    else {
+        if (s < audio_stat_min) audio_stat_min = s;
+        if (s > audio_stat_max) audio_stat_max = s;
+    }
+    audio_stat_sum += s;
+    ++audio_stat_count;
+    return s;
+}
+
+// Log the audio stats once (called when a game exits): proves the
+// samples are centred (mean near 0) and not silent/clipped.
+static void audio_log_stats(void) {
+    if (!audio_stat_count) return;
+    fprintf(stderr,
+            "q2-atari: audio samples=%lu min=%d max=%d mean=%ld\n",
+            audio_stat_count, audio_stat_min, audio_stat_max,
+            audio_stat_sum / (long)audio_stat_count);
+    audio_stat_count = 0;
+    audio_stat_sum = 0;
+}
+
 static unsigned gen_audio(int16_t *out, unsigned frames) {
     unsigned n = 0;
     if (myCartInfo.soundQuality == SOUND_WAVE) {
@@ -400,7 +439,7 @@ static unsigned gen_audio(int16_t *out, unsigned frames) {
             (unsigned)((tia_buf_idx - tia_out_idx) & (SOUND_SIZE - 1));
         if (avail > frames) avail = frames;
         for (unsigned i = 0; i < avail; ++i) {
-            int16_t s = (int16_t)(tia_buf[tia_out_idx] ^ 0x8000u);
+            int16_t s = audio_convert(tia_buf[tia_out_idx]);
             tia_out_idx = (uInt16)((tia_out_idx + 1) & (SOUND_SIZE - 1));
             out[2 * n] = s;
             out[2 * n + 1] = s;
@@ -409,7 +448,7 @@ static unsigned gen_audio(int16_t *out, unsigned frames) {
     } else {
         for (unsigned i = 0; i < frames; ++i) {
             Tia_process();
-            int16_t s = (int16_t)(*aptr ^ 0x8000u);
+            int16_t s = audio_convert(*aptr);
             out[2 * n] = s;
             out[2 * n + 1] = s;
             ++n;
@@ -437,7 +476,7 @@ static void pump_audio(void) {
 // Input
 // ---------------------------------------------------------------------------
 struct Held {
-    bool up, down, left, right, fire;
+    bool up, down, left, right, fire, play_fire;
 };
 
 static void clear_events(void) {
@@ -455,7 +494,9 @@ static void apply_held(const Held *h) {
     myStellaEvent.set(Event::JoystickZeroDown, h->down ? 1 : 0);
     myStellaEvent.set(Event::JoystickZeroLeft, h->left ? 1 : 0);
     myStellaEvent.set(Event::JoystickZeroRight, h->right ? 1 : 0);
-    myStellaEvent.set(Event::JoystickZeroFire, h->fire ? 1 : 0);
+    // Fire is Centre held OR Play held (see drain_events).
+    myStellaEvent.set(Event::JoystickZeroFire,
+                      (h->fire || h->play_fire) ? 1 : 0);
 }
 
 // One-frame pulse for a console switch: set, run a frame, clear.
@@ -484,6 +525,10 @@ static void pulse_switch(Console *console, Event::Type type) {
 // sensitivity, the same conversion q2-utilities uses.
 #define WHEEL_UNITS_PER_TICK 28
 
+// When Play was pressed down (monotonic ns); the up branch uses it
+// to tell a tap (<300 ms, = Select) from a hold (= fire).
+static uint64_t play_down_ns_ = 0;
+
 // Drain platform events. Returns: 0 keep playing, 1 exit to picker,
 // 2 quit the app. Pulses (select/reset/etc.) are applied immediately.
 // Held directions/fire are written into *held. One-frame pulses
@@ -498,14 +543,22 @@ static int drain_events(Console *console, Held *held, unsigned *pulse) {
             // can span several ticks; accumulate and emit one pulse
             // per tick (at most one per direction per frame — the
             // remainder stays queued for the next frame).
+            // DIRECTION (fixed v0.2.0): firmware travel rises
+            // anticlockwise (q2-pod: "the wheel's x falls
+            // clockwise"), and the Q2 list convention — followed by
+            // q2-utilities (focus -= step) and q2emu (wheel(+n) is
+            // down/next) — is clockwise = down, anticlockwise = up.
+            // So positive travel = UP, negative travel = DOWN. The
+            // v0.1.0 code had this backwards in both the game and
+            // the picker.
             static int wheel_acc = 0;
             wheel_acc += e.x;
             while (wheel_acc >= WHEEL_UNITS_PER_TICK) {
-                *pulse |= 2u;
+                *pulse |= 1u;  // up
                 wheel_acc -= WHEEL_UNITS_PER_TICK;
             }
             while (wheel_acc <= -WHEEL_UNITS_PER_TICK) {
-                *pulse |= 1u;
+                *pulse |= 2u;  // down
                 wheel_acc += WHEEL_UNITS_PER_TICK;
             }
         } else if (e.kind == 'k') {
@@ -523,7 +576,22 @@ static int drain_events(Console *console, Held *held, unsigned *pulse) {
                 held->right = down;
                 break;
             case FW_KEY_PLAY:
-                if (down) pulse_switch(console, Event::ConsoleSelect);
+                // Play is fire while held, and a short tap (<300 ms)
+                // is Console Select — so one button does both without
+                // Select firing a shot: on release, fire is cleared
+                // before the Select pulse runs its frame. Centre
+                // remains fire too (the v0.1.0 mapping, and the Q2
+                // convention that Centre is the primary action).
+                if (down) {
+                    held->play_fire = true;
+                    play_down_ns_ = clock_ns();
+                } else {
+                    held->play_fire = false;
+                    myStellaEvent.set(Event::JoystickZeroFire,
+                                      held->fire ? 1 : 0);
+                    if (clock_ns() - play_down_ns_ < 300000000ull)
+                        pulse_switch(console, Event::ConsoleSelect);
+                }
                 break;
             case FW_KEY_RETURN:
                 // Exit on the press, before the firmware TERMs the
@@ -614,12 +682,15 @@ static int run_picker(char *out_path, size_t out_size) {
         if (e.kind == 'w' && rom_count > 0) {
             // Raw wheel travel: one tick per 28 units (see
             // WHEEL_UNITS_PER_TICK); a fast spin can move several
-            // rows at once.
+            // rows at once. Direction: positive travel is
+            // anticlockwise = up the list, negative (clockwise) =
+            // down — same convention as the game (see drain_events);
+            // v0.1.0 had this backwards.
             static int wheel_acc = 0;
             wheel_acc += e.x;
             int ticks = wheel_acc / WHEEL_UNITS_PER_TICK;
             wheel_acc -= ticks * WHEEL_UNITS_PER_TICK;
-            selected += ticks;
+            selected -= ticks;
             if (selected < 0) selected = 0;
             if (selected > rom_count - 1) selected = rom_count - 1;
         } else if (e.kind == 'k' && e.action == 'd') {
@@ -719,7 +790,8 @@ static int run_game(const char *rom_path) {
         if (pulse & 2u) myStellaEvent.set(Event::JoystickZeroDown, held.down ? 1 : 0);
         if (pulse & 4u) myStellaEvent.set(Event::JoystickZeroLeft, held.left ? 1 : 0);
         if (pulse & 8u) myStellaEvent.set(Event::JoystickZeroRight, held.right ? 1 : 0);
-        if (pulse & 16u) myStellaEvent.set(Event::JoystickZeroFire, held.fire ? 1 : 0);
+        if (pulse & 16u) myStellaEvent.set(Event::JoystickZeroFire,
+                                           (held.fire || held.play_fire) ? 1 : 0);
 
         ++gAtariFrames;
         ++gTotalAtariFrames;
@@ -734,6 +806,7 @@ static int run_game(const char *rom_path) {
     }
 
     clear_events();
+    audio_log_stats();
     delete console;
     free(rom);
     return rc;
@@ -775,8 +848,55 @@ static int run_smoke(const char *rom_path, const char *prefix, int frames) {
     printf("SMOKE cart=%s size=%u tv=%s\n",
            console->myCartridge ? console->myCartridge->name() : "?",
            rom_size, myCartInfo.tv_type == PAL ? "PAL" : "NTSC");
+    // Scripted input for the playable-ROM test (env
+    // Q2_ATARI_SMOKE_INPUT="frame:event,frame:event", events:
+    // up,down,left,right,fire,fireoff,upoff,downoff,leftoff,rightoff,
+    // wheelup,wheeldown (one-frame pulses), select (one-frame pulse)).
+    // Lets QEMU prove joystick/fire work without booting the emulator.
+    // Held events persist until their *off event; pulses last one frame.
+    const char *script = getenv("Q2_ATARI_SMOKE_INPUT");
+    bool s_up = false, s_down = false, s_left = false, s_right = false,
+         s_fire = false;
     for (int i = 0; i < frames; ++i) {
+        if (script) {
+            // Re-scan the script each frame (it is short).
+            bool p_up = false, p_down = false, p_select = false;
+            char *copy = strdup(script);
+            char *save = NULL;
+            for (char *tok = strtok_r(copy, ",", &save); tok;
+                 tok = strtok_r(NULL, ",", &save)) {
+                int at = 0;
+                char ev[32] = { 0 };
+                if (sscanf(tok, "%d:%31s", &at, ev) != 2 || at != i) continue;
+                if (!strcmp(ev, "up")) s_up = true;
+                else if (!strcmp(ev, "down")) s_down = true;
+                else if (!strcmp(ev, "left")) s_left = true;
+                else if (!strcmp(ev, "right")) s_right = true;
+                else if (!strcmp(ev, "fire")) s_fire = true;
+                else if (!strcmp(ev, "upoff")) s_up = false;
+                else if (!strcmp(ev, "downoff")) s_down = false;
+                else if (!strcmp(ev, "leftoff")) s_left = false;
+                else if (!strcmp(ev, "rightoff")) s_right = false;
+                else if (!strcmp(ev, "fireoff")) s_fire = false;
+                else if (!strcmp(ev, "wheelup")) p_up = true;
+                else if (!strcmp(ev, "wheeldown")) p_down = true;
+                else if (!strcmp(ev, "select")) p_select = true;
+            }
+            free(copy);
+            myStellaEvent.set(Event::JoystickZeroUp,
+                              (s_up || p_up) ? 1 : 0);
+            myStellaEvent.set(Event::JoystickZeroDown,
+                              (s_down || p_down) ? 1 : 0);
+            myStellaEvent.set(Event::JoystickZeroLeft, s_left ? 1 : 0);
+            myStellaEvent.set(Event::JoystickZeroRight, s_right ? 1 : 0);
+            myStellaEvent.set(Event::JoystickZeroFire, s_fire ? 1 : 0);
+            myStellaEvent.set(Event::ConsoleSelect, p_select ? 1 : 0);
+        }
         console->update();
+        // One-frame pulses clear after the frame they fired in.
+        myStellaEvent.set(Event::JoystickZeroUp, s_up ? 1 : 0);
+        myStellaEvent.set(Event::JoystickZeroDown, s_down ? 1 : 0);
+        myStellaEvent.set(Event::ConsoleSelect, 0);
         ++gAtariFrames;
         ++gTotalAtariFrames;
     }
@@ -785,11 +905,24 @@ static int run_smoke(const char *rom_path, const char *prefix, int frames) {
     // TIA sound path runs (the DS drove it with a TIMER2 interrupt;
     // the Q2 frame loop drives it). The test ROM never touches the
     // audio registers, so the samples are silence — the check is that
-    // generation runs without crashing and returns the count.
+    // generation runs without crashing and returns the count. With
+    // the v0.2.0 DC fix, silence must be 0 (old code: -32768).
     static int16_t probe[512 * 2];
     unsigned audio_got = gen_audio(probe, 349);
-    printf("SMOKE audio samples=%u tia_buf_idx=%u\n", audio_got,
-           (unsigned)tia_buf_idx);
+    int audio_min = 0, audio_max = 0;
+    long audio_sum = 0;
+    for (unsigned i = 0; i < audio_got; ++i) {
+        int16_t s = probe[2 * i];
+        if (i == 0) audio_min = audio_max = s;
+        else {
+            if (s < audio_min) audio_min = s;
+            if (s > audio_max) audio_max = s;
+        }
+        audio_sum += s;
+    }
+    printf("SMOKE audio samples=%u tia_buf_idx=%u min=%d max=%d mean=%ld\n",
+           audio_got, (unsigned)tia_buf_idx, audio_min, audio_max,
+           audio_got ? audio_sum / (long)audio_got : 0);
 
     int height = (int)theTIA.height();
     if (height < 1) height = 192;
