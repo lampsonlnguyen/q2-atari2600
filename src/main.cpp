@@ -386,23 +386,28 @@ static void blit_frame(uint32_t *cv) {
 // Non-WAVE samples land in *aptr/*bptr (shim slots, read after each
 // call); WAVE samples land in the tia_buf ring, drained below.
 //
-// DC fix (v0.2.0): TIASound's raw samples are UNIPOLAR, 0..3840
-// (Outvol[0]+Outvol[1], each 0..15, times 128 in sampleExtender).
-// Silence is raw 0. The old conversion `raw ^ 0x8000` turned silence
-// into a constant -32768 (full negative rail) with only 3840 counts
-// of variation on top — inaudible, and a huge DC offset into ALSA.
-// The correct conversion centres the signal: a slow DC tracker
-// (alpha 1/4096, ~200 ms) follows the signal mean, the deviation
-// from it is amplified x8 (max deviation 1920 * 8 = 15360..30720,
-// inside s16) and clamped. Silence stays exactly 0.
+// DC fix (v0.2.0): TIASound's raw samples are UNIPOLAR. The range is
+// NOT 0..3840: StellaDS's TIA poke pre-scales AUDV by << 3
+// (TIA.cpp:2297: AUDV[0] = (value & 0x0f) << 3), so one channel at
+// volume 15 gives Outvol 120, raw 120*128 = 15360, and both channels
+// together give 0..30720 (measured: volume 8 -> raw 0/8192). Silence
+// is raw 0. The old conversion `raw ^ 0x8000` turned silence into a
+// constant -32768 (full negative rail) with only 3840 counts of
+// variation on top — inaudible, and a huge DC offset into ALSA.
+// The correct conversion centres the signal: a DC tracker (alpha
+// 1/256, ~25 ms at 10 kHz) follows the signal mean, the deviation
+// from it is amplified x2 (max deviation 15360 * 2 = 30720, inside
+// s16) and clamped. Silence stays exactly 0. (The first version of
+// this fix used x8, which is right for a 0..3840 range but clips at
+// 32767 for the real 0..30720 range — measured on the fire beep.)
 static int32_t audio_dc = 0;
 static unsigned long audio_stat_count = 0;
 static long audio_stat_sum = 0;
 static int audio_stat_min = 0, audio_stat_max = 0;
 
 static int16_t audio_convert(uint16_t raw) {
-    audio_dc += ((int32_t)raw - audio_dc) >> 12;
-    int32_t v = ((int32_t)raw - audio_dc) * 8;
+    audio_dc += ((int32_t)raw - audio_dc) >> 8;
+    int32_t v = ((int32_t)raw - audio_dc) * 2;
     if (v > 32767) v = 32767;
     else if (v < -32768) v = -32768;
     int16_t s = (int16_t)v;
@@ -439,6 +444,9 @@ static unsigned gen_audio(int16_t *out, unsigned frames) {
             (unsigned)((tia_buf_idx - tia_out_idx) & (SOUND_SIZE - 1));
         if (avail > frames) avail = frames;
         for (unsigned i = 0; i < avail; ++i) {
+            if (getenv("Q2_ATARI_DEBUG_AUDIO") && i < 40)
+                fprintf(stderr, "q2-atari: raw[%u]=%u dc=%ld\n", i,
+                        (unsigned)tia_buf[tia_out_idx], (long)audio_dc);
             int16_t s = audio_convert(tia_buf[tia_out_idx]);
             tia_out_idx = (uInt16)((tia_out_idx + 1) & (SOUND_SIZE - 1));
             out[2 * n] = s;
@@ -448,6 +456,9 @@ static unsigned gen_audio(int16_t *out, unsigned frames) {
     } else {
         for (unsigned i = 0; i < frames; ++i) {
             Tia_process();
+            if (getenv("Q2_ATARI_DEBUG_AUDIO") && i < 40)
+                fprintf(stderr, "q2-atari: raw[%u]=%u dc=%ld\n", i,
+                        (unsigned)*aptr, (long)audio_dc);
             int16_t s = audio_convert(*aptr);
             out[2 * n] = s;
             out[2 * n + 1] = s;
@@ -909,6 +920,13 @@ static int run_smoke(const char *rom_path, const char *prefix, int frames) {
     // the v0.2.0 DC fix, silence must be 0 (old code: -32768).
     static int16_t probe[512 * 2];
     unsigned audio_got = gen_audio(probe, 349);
+    if (getenv("Q2_ATARI_DEBUG_AUDIO")) {
+        // Converted probe values (first 40), for amplitude diagnosis.
+        fprintf(stderr, "q2-atari: probe first 40:");
+        for (int i = 0; i < 40 && i < (int)audio_got; ++i)
+            fprintf(stderr, " %d", (int)probe[2 * i]);
+        fprintf(stderr, "\n");
+    }
     int audio_min = 0, audio_max = 0;
     long audio_sum = 0;
     for (unsigned i = 0; i < audio_got; ++i) {
