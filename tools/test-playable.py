@@ -109,10 +109,20 @@ time.sleep(3)
 shot("game-t3-after")
 
 # Back to the picker, then launch the second ROM (test.a26).
+# Picker controls (q2-boy model): Play = next ROM, wheel = browse
+# (21 units/tick, q2-boy's read_wheel).
 q2.key("return")
 time.sleep(2)
 shot("picker-after-return")
-q2.wheel(1)              # select test.a26 (second row)
+q2.key("play")           # next ROM -> test.a26 (second row)
+time.sleep(1)
+shot("picker-play-next")
+q2.key("play")           # already last row: stays on test.a26
+time.sleep(1)
+q2.wheel(-1)             # anticlockwise -> up -> playtest.a26
+time.sleep(1)
+shot("picker-wheel-up")
+q2.wheel(1)              # clockwise -> down -> test.a26
 time.sleep(1)
 shot("picker-test-row")
 q2.key("centre")         # launch test.a26
