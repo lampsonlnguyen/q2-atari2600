@@ -10,15 +10,22 @@
 // be opened, the game runs silent.
 // Input: a datagram socket at /tmp/q2-atari.input.sock, where the
 // firmware sends wheel ('w'), key ('k') and touch ('t') events as
-// short text lines. The game deliberately does NOT open or grab the
-// md-gpio-keys device: an EVIOCGRAB would stop the firmware seeing
-// the presses, so it would never send the datagrams at all.
+// short text lines — unless the firmware is too old to forward keys,
+// in which case the game grabs the md-gpio-keys device itself,
+// exactly like q2-boy (platform.c grab_buttons, main.c
+// firmware_keys): platform_open takes the firmware_keys flag (true
+// when /tmp/q2-addon.caps contains "gameview") and only grabs when
+// it is false. An unconditional EVIOCGRAB would stop the firmware
+// seeing the presses, so it would never send the datagrams at all
+// (the v0.1.0 bug); with the cap check the grab only happens on
+// firmware that never forwards keys in the first place.
 #include "platform.h"
 
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
+#include <linux/input.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,8 +39,10 @@
 
 #define INPUT_SOCKET "/tmp/q2-atari.input.sock"
 
-static int fb = -1, sock = -1, back, stride, original_y;
+static int fb = -1, keys = -1, sock = -1, back, stride, original_y;
 static int stop_pipe[2] = { -1, -1 };
+static int firmware_buttons;
+static int raw_buttons;
 static volatile sig_atomic_t signal_writer = -1;
 static struct fb_var_screeninfo video;
 static size_t map_size;
@@ -55,6 +64,28 @@ static void request_quit(int sig) {
     if (signal_writer >= 0) (void)write(signal_writer, "q", 1);
     errno = saved_errno;
 }
+
+// q2-boy's grab_buttons (platform.c:54-67), verbatim: find the
+// md-gpio-keys device and grab it exclusively, so the game reads the
+// physical keys itself. Only called when the firmware does not
+// forward keys (no "gameview" in /tmp/q2-addon.caps).
+static void grab_buttons(void) {
+    for (int i = 0; i < 32; ++i) {
+        char path[48], name[80] = { 0 };
+        snprintf(path, sizeof path, "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) continue;
+        if (ioctl(fd, EVIOCGNAME(sizeof name), name) >= 0 &&
+            !strcmp(name, "md-gpio-keys") && ioctl(fd, EVIOCGRAB, 1) == 0) {
+            keys = fd;
+            raw_buttons = 1;
+            return;
+        }
+        close(fd);
+    }
+}
+
+int platform_raw_buttons(void) { return raw_buttons; }
 
 // --- ALSA, resolved at runtime -------------------------------------------
 // Only the handful of entry points the frontend needs. The numeric
@@ -167,7 +198,7 @@ void platform_audio_write(const int16_t *samples, unsigned frames) {
 
 // --- framebuffer ----------------------------------------------------------
 
-int platform_open(void) {
+int platform_open(int firmware_keys) {
     if (pipe2(stop_pipe, O_NONBLOCK | O_CLOEXEC)) return 0;
     signal_writer = stop_pipe[1];
     signal(SIGTERM, request_quit);
@@ -196,8 +227,12 @@ int platform_open(void) {
     if (bind(sock, (struct sockaddr *)&address, sizeof address)) return 0;
 
     open_audio();
-    fprintf(stderr, "q2-atari: ALSA=%s (input via firmware socket)\n",
-            pcm ? "open" : "unavailable");
+    firmware_buttons = firmware_keys;
+    if (!firmware_buttons) grab_buttons();
+    fprintf(stderr, "q2-atari: ALSA=%s GPIO=%s (input via firmware socket%s)\n",
+            pcm ? "open" : "unavailable",
+            raw_buttons ? "grabbed" : "using firmware fallback",
+            raw_buttons ? ", GPIO fallback" : "");
     return 1;
 }
 
@@ -219,6 +254,21 @@ void platform_present(void) {
 }
 
 int platform_event(Q2Event *e) {
+    // q2-boy's platform_event (platform.c): the grabbed GPIO device
+    // is read first. EV_SYN/SYN_DROPPED becomes 'r' (clear all held
+    // buttons); EV_KEY becomes 'g' with the Linux key code (Return
+    // 103, Play 108, Previous 165, Next 163, Centre 116).
+    struct input_event key;
+    if (keys >= 0 && read(keys, &key, sizeof key) == sizeof key) {
+        if (key.type == EV_SYN && key.code == SYN_DROPPED) {
+            *e = (Q2Event){ 'r', 0, 0, 0 };
+        } else if (key.type == EV_KEY && key.value <= 1) {
+            *e = (Q2Event){ 'g', key.value ? 'd' : 'u', (int)key.code, 0 };
+        } else {
+            *e = (Q2Event){ 0 };
+        }
+        return 1;
+    }
     char buffer[80];
     ssize_t n = sock < 0 ? -1 : recv(sock, buffer, sizeof buffer - 1, MSG_DONTWAIT);
     if (n < 1) return 0;
@@ -237,7 +287,7 @@ int platform_event(Q2Event *e) {
 void platform_wait(uint64_t deadline_ns) {
     if (q2_quitting) return;
     struct pollfd input[] = {
-        { sock, POLLIN, 0 }, { stop_pipe[0], POLLIN, 0 },
+        { keys, POLLIN, 0 }, { sock, POLLIN, 0 }, { stop_pipe[0], POLLIN, 0 },
     };
     struct timespec timeout, *limit = NULL;
     if (deadline_ns != UINT64_MAX) {
@@ -252,6 +302,7 @@ void platform_wait(uint64_t deadline_ns) {
 }
 
 void platform_close(void) {
+    if (keys >= 0) { close(keys); keys = -1; raw_buttons = 0; }
     if (pcm) { alsa_drop(pcm); alsa_close(pcm); pcm = NULL; }
     if (alsa_handle) { dlclose(alsa_handle); alsa_handle = NULL; }
     if (sock >= 0) { close(sock); unlink(INPUT_SOCKET); }
