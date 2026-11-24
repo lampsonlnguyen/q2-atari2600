@@ -520,9 +520,13 @@ static void pulse_switch(Console *console, Event::Type type) {
 // Firmware datagram key codes (AWTK, q2-pod patch/addon.c): the
 // firmware sends "k d CODE" / "k u CODE" on the input socket. Return
 // 170, Centre 218, Play 171, Prev/Next side buttons 222/223 (172/173
-// are the same buttons on older firmware, per q2-pico8). There is no
-// direct GPIO input: the game must not grab md-gpio-keys, or the
-// firmware never sends these datagrams.
+// are the same buttons on older firmware, per q2-pico8). On firmware
+// too old to forward keys, the game grabs md-gpio-keys instead and
+// gets "g" events with the Linux codes (q2-boy's decode_key,
+// main.c:2939): Return 103, Centre 116, Play 108, Previous 165,
+// Next 163. A "g" event is translated to the matching firmware code
+// below, so the rest of the input handling is identical; socket "k"
+// events are ignored while GPIO is grabbed, like q2-boy.
 #define FW_KEY_RETURN 170
 #define FW_KEY_PLAY 171
 #define FW_KEY_PREV 222
@@ -530,11 +534,37 @@ static void pulse_switch(Console *console, Event::Type type) {
 #define FW_KEY_NEXT 223
 #define FW_KEY_NEXT_OLD 173
 #define FW_KEY_CENTRE 218
+#define GPIO_KEY_RETURN 103
+#define GPIO_KEY_PLAY 108
+#define GPIO_KEY_PREV 165
+#define GPIO_KEY_NEXT 163
+#define GPIO_KEY_CENTRE 116
 
-// One wheel tick is 28 units of the firmware's raw travel (200 per
-// turn, rising anticlockwise) at the default 50% Controls
-// sensitivity, the same conversion q2-utilities uses.
-#define WHEEL_UNITS_PER_TICK 28
+// One wheel tick is 21 units of the firmware's raw travel (200 per
+// turn, rising anticlockwise) — q2-boy's read_wheel (main.c:2917)
+// uses 21 (38 in its cover-flow browser; Atari has no cover flow).
+// Each event's delta is clamped to +/-84 and the accumulator resets
+// after 300 ms idle, exactly like q2-boy. (v0.2.0 used 28 with no
+// clamp and no expiry, citing q2-utilities' 50% = 28 conversion.)
+#define WHEEL_UNITS_PER_TICK 21
+#define WHEEL_MAX_DELTA 84
+#define WHEEL_IDLE_RESET_NS 300000000ull
+
+// q2-boy wheel accumulator (read_wheel, main.c:2917-2933). Feed one
+// 'w' datagram's travel; returns whole ticks: >0 anticlockwise =
+// up, <0 clockwise = down. Shared by the game and the picker.
+struct WheelAcc { int acc = 0; uint64_t last_ns = 0; };
+static int wheel_feed(WheelAcc *w, int delta, uint64_t now_ns) {
+    if (w->last_ns == 0 || now_ns - w->last_ns > WHEEL_IDLE_RESET_NS)
+        w->acc = 0;
+    w->last_ns = now_ns;
+    if (delta > WHEEL_MAX_DELTA) delta = WHEEL_MAX_DELTA;
+    if (delta < -WHEEL_MAX_DELTA) delta = -WHEEL_MAX_DELTA;
+    w->acc += delta;
+    int ticks = w->acc / WHEEL_UNITS_PER_TICK;
+    w->acc -= ticks * WHEEL_UNITS_PER_TICK;
+    return ticks;
+}
 
 // When Play was pressed down (monotonic ns); the up branch uses it
 // to tell a tap (<300 ms, = Select) from a hold (= fire).
@@ -561,22 +591,41 @@ static int drain_events(Console *console, Held *held, unsigned *pulse) {
             // down/next) — is clockwise = down, anticlockwise = up.
             // So positive travel = UP, negative travel = DOWN. The
             // v0.1.0 code had this backwards in both the game and
-            // the picker.
-            static int wheel_acc = 0;
-            wheel_acc += e.x;
-            while (wheel_acc >= WHEEL_UNITS_PER_TICK) {
-                *pulse |= 1u;  // up
-                wheel_acc -= WHEEL_UNITS_PER_TICK;
+            // the picker. Tick size, clamp and idle expiry follow
+            // q2-boy's read_wheel (see wheel_feed above).
+            static WheelAcc wheel;
+            int ticks = wheel_feed(&wheel, e.x, clock_ns());
+            if (ticks > 0) *pulse |= 1u;  // up
+            else if (ticks < 0) *pulse |= 2u;  // down
+        } else if (e.kind == 'r') {
+            // q2-boy's read_event: an EV_SYN/SYN_DROPPED clears
+            // every held button (a release lost in the input queue
+            // must not stick a direction or fire on).
+            held->up = held->down = held->left = held->right = false;
+            held->fire = held->play_fire = false;
+            play_down_ns_ = 0;
+        } else if (e.kind == 'g' || e.kind == 'k') {
+            // Normalize a raw GPIO key to its firmware code
+            // (q2-boy's decode_key, main.c:2939). While GPIO is
+            // grabbed, socket keys are ignored, like q2-boy.
+            int key_code;
+            if (e.kind == 'g') {
+                switch (e.x) {
+                case GPIO_KEY_RETURN: key_code = FW_KEY_RETURN; break;
+                case GPIO_KEY_PLAY: key_code = FW_KEY_PLAY; break;
+                case GPIO_KEY_PREV: key_code = FW_KEY_PREV; break;
+                case GPIO_KEY_NEXT: key_code = FW_KEY_NEXT; break;
+                case GPIO_KEY_CENTRE: key_code = FW_KEY_CENTRE; break;
+                default: continue;
+                }
+            } else {
+                if (platform_raw_buttons()) continue;
+                key_code = e.x;
             }
-            while (wheel_acc <= -WHEEL_UNITS_PER_TICK) {
-                *pulse |= 2u;  // down
-                wheel_acc += WHEEL_UNITS_PER_TICK;
-            }
-        } else if (e.kind == 'k') {
             bool down = e.action == 'd';
-            fprintf(stderr, "q2-atari: firmware key %d %s\n", e.x,
+            fprintf(stderr, "q2-atari: firmware key %d %s\n", key_code,
                     down ? "down" : "up");
-            switch (e.x) {
+            switch (key_code) {
             case FW_KEY_CENTRE:
                 held->fire = down;
                 break;
@@ -666,7 +715,7 @@ static void draw_picker(uint32_t *cv, const char *dir, int selected, int top) {
             draw_text(cv, 12, y, name, idx == selected ? 0xFFFFFFFFu : 0xFFBBBBBB);
         }
     }
-    draw_text(cv, 12, Q2_HEIGHT - 14, "WHEEL: BROWSE  CENTRE: LAUNCH  RETURN: QUIT",
+    draw_text(cv, 12, Q2_HEIGHT - 14, "WHEEL: BROWSE  CENTRE: LAUNCH  PLAY: NEXT  RETURN: QUIT",
               0xFF888888u);
 }
 
@@ -691,29 +740,47 @@ static int run_picker(char *out_path, size_t out_size) {
             continue;
         }
         if (e.kind == 'w' && rom_count > 0) {
-            // Raw wheel travel: one tick per 28 units (see
-            // WHEEL_UNITS_PER_TICK); a fast spin can move several
-            // rows at once. Direction: positive travel is
-            // anticlockwise = up the list, negative (clockwise) =
-            // down — same convention as the game (see drain_events);
-            // v0.1.0 had this backwards.
-            static int wheel_acc = 0;
-            wheel_acc += e.x;
-            int ticks = wheel_acc / WHEEL_UNITS_PER_TICK;
-            wheel_acc -= ticks * WHEEL_UNITS_PER_TICK;
+            // Wheel: q2-boy's read_wheel (21 units/tick, clamp,
+            // 300 ms idle expiry — see wheel_feed). Direction:
+            // positive travel is anticlockwise = up the list,
+            // negative (clockwise) = down — same convention as the
+            // game (see drain_events); v0.1.0 had this backwards.
+            static WheelAcc wheel;
+            int ticks = wheel_feed(&wheel, e.x, clock_ns());
             selected -= ticks;
             if (selected < 0) selected = 0;
             if (selected > rom_count - 1) selected = rom_count - 1;
-        } else if (e.kind == 'k' && e.action == 'd') {
-            if ((e.x == FW_KEY_CENTRE || e.x == FW_KEY_PLAY) && rom_count > 0) {
+        } else if ((e.kind == 'k' || e.kind == 'g') && e.action == 'd') {
+            // Same key normalization as drain_events: a raw GPIO
+            // key translates to its firmware code; socket keys are
+            // ignored while GPIO is grabbed (q2-boy's decode_key).
+            int key_code;
+            if (e.kind == 'g') {
+                switch (e.x) {
+                case GPIO_KEY_RETURN: key_code = FW_KEY_RETURN; break;
+                case GPIO_KEY_PLAY: key_code = FW_KEY_PLAY; break;
+                case GPIO_KEY_PREV: key_code = FW_KEY_PREV; break;
+                case GPIO_KEY_NEXT: key_code = FW_KEY_NEXT; break;
+                case GPIO_KEY_CENTRE: key_code = FW_KEY_CENTRE; break;
+                default: continue;
+                }
+            } else {
+                if (platform_raw_buttons()) continue;
+                key_code = e.x;
+            }
+            if (key_code == FW_KEY_CENTRE && rom_count > 0) {
                 snprintf(out_path, out_size, "%s/%s", dir, rom_names[selected]);
                 return 1;
-            } else if (e.x == FW_KEY_RETURN) {
+            } else if (key_code == FW_KEY_PLAY && rom_count > 0) {
+                // q2-boy's browser: Play = next ROM (+1); Centre
+                // launches. (v0.2.0 had Play launch too.)
+                if (selected < rom_count - 1) ++selected;
+            } else if (key_code == FW_KEY_RETURN) {
                 return 0;
-            } else if ((e.x == FW_KEY_PREV || e.x == FW_KEY_PREV_OLD) &&
+            } else if ((key_code == FW_KEY_PREV || key_code == FW_KEY_PREV_OLD) &&
                        selected > 0) {
                 --selected;
-            } else if ((e.x == FW_KEY_NEXT || e.x == FW_KEY_NEXT_OLD) &&
+            } else if ((key_code == FW_KEY_NEXT || key_code == FW_KEY_NEXT_OLD) &&
                        selected < rom_count - 1) {
                 ++selected;
             }
@@ -990,6 +1057,22 @@ static int run_smoke(const char *rom_path, const char *prefix, int frames) {
     return ok ? 0 : 1;
 }
 
+// q2-boy's has_cap (main.c:665): true when caps holds word as a
+// whole whitespace-separated word. /tmp/q2-addon.caps lists the
+// firmware's card-app features; "gameview" means it forwards keys
+// to the game on the input socket (q2-boy's main.c:3588).
+#define ADDON_CAPS "/tmp/q2-addon.caps"
+static bool has_cap(const char *caps, const char *word) {
+    size_t length = strlen(word);
+    for (const char *at = caps; *at;) {
+        at += strspn(at, " \t\r\n");
+        size_t n = strcspn(at, " \t\r\n");
+        if (n == length && !strncmp(at, word, n)) return true;
+        at += n;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
     // The core's globals need their constructors before anything
@@ -1012,7 +1095,22 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (!platform_open()) {
+    // Firmware keys (q2-boy's main.c:3588): when the firmware
+    // advertises "gameview" in /tmp/q2-addon.caps it forwards keys
+    // on the input socket, so the game must not grab GPIO. On older
+    // firmware without the cap, platform_open grabs md-gpio-keys
+    // and the game reads raw 'g' events instead.
+    char caps[512] = { 0 };
+    FILE *caps_file = fopen(ADDON_CAPS, "r");
+    if (caps_file) {
+        size_t n = fread(caps, 1, sizeof caps - 1, caps_file);
+        caps[n] = 0;
+        fclose(caps_file);
+    }
+    bool firmware_keys = has_cap(caps, "gameview");
+    fprintf(stderr, "q2-atari: firmware_keys=%d (caps: %s)\n",
+            firmware_keys ? 1 : 0, caps);
+    if (!platform_open(firmware_keys)) {
         fprintf(stderr, "q2-atari: platform_open failed\n");
         return 1;
     }
