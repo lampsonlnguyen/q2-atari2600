@@ -35,6 +35,9 @@ The archive includes no commercial ROMs.
 
 ## Controls (v1)
 
+Learned from q2-boy (Pocket Boy v0.4.2, `lampsonlnguyen/q2-boy`) — see
+"Controls: learned from q2-boy" below for the audit. In a game:
+
 | Q2 input | Atari 2600 |
 | --- | --- |
 | Wheel up / down | Joystick up / down |
@@ -44,6 +47,9 @@ The archive includes no commercial ROMs.
 | Play (short tap, <300 ms) | Select (console switch) |
 | Touch bottom strip, left to right | Select, Reset, Color/BW, Difficulty |
 | Return | Back to the ROM picker (exits the game) |
+
+In the ROM picker, the wheel browses, Centre launches, **Play moves to
+the next ROM** (q2-boy's browser), Return quits the app.
 
 A playable 6502 test ROM is included in the repo
 (`tools/make-play-rom.py`, an original 4K game: move the ship with
@@ -70,8 +76,8 @@ rest:
   palette for video, and TIASound's sample buffer for audio.
 - `src/platform.c` / `src/platform.h` — Q2 platform layer: `/dev/fb0`
   framebuffer (375×320), ALSA audio (loaded at runtime with `dlopen`, so
-  the binary stays static-friendly), and the firmware's input socket
-  only — the game must not grab the GPIO buttons (see Input below).
+  the binary stays static-friendly), and input: the firmware's input
+  socket, with a GPIO fallback on old firmware (see Input below).
 - `src/q2shim.cpp` — the handful of globals the core expects its frontend
   to provide: `mySoundFreq`, `my_filename`, the frame counters
   (`gAtariFrames`, `gTotalAtariFrames`), SaveKey state, `tv_type_requested`,
@@ -120,28 +126,66 @@ conversion is the first thing to revisit.
 
 ### Input
 
-Input comes only from the firmware's datagram socket
-(`/tmp/q2-atari.input.sock`), the same protocol q2-pico8 uses — the game
-must NOT grab the `md-gpio-keys` device, or the firmware stops seeing
-the presses and never sends the datagrams. The firmware sends:
+Input comes from the firmware's datagram socket
+(`/tmp/q2-atari.input.sock`), the same protocol q2-pico8 uses. The
+firmware sends:
 
 - `k d CODE` / `k u CODE` — a key down/up, AWTK codes: Return 170,
   Centre 218, Play 171, Prev/Next side buttons 222/223 (172/173 on
   older firmware). Centre is fire (held), the side buttons are
-  joystick left/right (held), Play pulses Console Select, Return exits
-  to the picker (on the press, before the firmware TERMs the game for
-  holding Return). In the picker, Centre/Play launches, Return quits,
-  the side buttons move the selection.
+  joystick left/right (held), Play is fire while held and pulses
+  Console Select on a short tap (<300 ms), Return exits to the picker
+  (on the press, before the firmware TERMs the game for holding
+  Return). In the picker, Centre launches, Play moves to the next ROM,
+  Return quits, the side buttons move the selection.
 - `w N` — the wheel's raw travel since the last firmware UI loop pass
-  (200 per turn, rising anticlockwise). One tick is 28 units at the
-  default 50% Controls sensitivity; the frontend accumulates travel
-  and emits one one-frame joystick pulse per tick (up/down in a game,
-  one row per tick in the picker).
+  (200 per turn, rising anticlockwise). One tick is 21 units, each
+  event's delta is clamped to ±84, and the accumulator resets after
+  300 ms idle — q2-boy's `read_wheel`. The frontend emits one
+  one-frame joystick pulse per tick (up/down in a game, one row per
+  tick in the picker).
 - `t d X Y` / `t m X Y` / `t u X Y` — touch down/move/up in the 375×320
   landscape view. Only the down acts: in a game, the bottom strip
   (y ≥ 280) holds four console-switch zones — Select, Reset, Color/BW,
   Difficulty A/B. In the picker, a tap selects a row; tapping the
   selected row launches it.
+
+On firmware too old to forward keys, the game grabs the `md-gpio-keys`
+device itself instead, exactly like q2-boy: `main()` reads
+`/tmp/q2-addon.caps` and only grabs when it lacks the word `gameview`
+(q2-boy's `main.c:3588`). The grabbed device delivers `g` events with
+the Linux key codes (Return 103, Centre 116, Play 108, Previous 165,
+Next 163), which are translated to the matching firmware codes above,
+and an `r` (EV_SYN/SYN_DROPPED) event clears all held buttons. While
+GPIO is grabbed, socket `k` events are ignored, like q2-boy's
+`decode_key`. An unconditional EVIOCGRAB must never be done: it stops
+the firmware seeing the presses, so it never sends the datagrams
+(the v0.1.0 bug).
+
+### Controls: learned from q2-boy
+
+The control scheme was audited against q2-boy (Pocket Boy v0.4.2,
+`src/platform.c` + `src/main.c`) and aligned where it applies:
+
+| Behaviour | q2-boy | Atari |
+| --- | --- | --- |
+| Key codes (socket) | Return 170, Play 171, Prev 222, Next 223, Centre 218 | Same |
+| Key codes (GPIO) | Return 103, Play 108, Prev 165, Next 163, Centre 116 | Same (fallback only) |
+| Centre | A / fire (held) | Fire (held) |
+| Prev / Next | Left / Right (held) | Left / Right (held) |
+| Wheel tick | 21 units, clamp ±84, 300 ms idle expiry | Same (was 28, no clamp, no expiry) |
+| Wheel in game | Ignored | Drives Up/Down — **kept deliberately**: the wheel is the Q2's signature input and the playtest game is built around it |
+| Return in game | D-pad Up (held); exit via touch Menu or Hold Return+Centre | Exits to picker — **kept deliberately**: Atari has no menu to exit through |
+| Play in game | D-pad Down (held) | Fire (hold) + Select (short tap) — **kept**: what the playtest game expects |
+| Picker Play | Next ROM (+1) | Same (was: launch) |
+| Picker Return | Go back | Quits the app (no parent screen) |
+| Console Select/Reset | Touch buttons only | Touch strip + Play-tap = Select |
+| GPIO fallback | Grab `md-gpio-keys` unless `gameview` cap | Same |
+| `r` (SYN_DROPPED) | Clears all held buttons | Same |
+
+Not adopted: q2-boy's user-remappable `controls.cfg` / Physical
+settings screen (Atari's mapping is hardcoded) — a future step, not
+part of this change.
 
 ### Frame pacing
 
