@@ -39,10 +39,20 @@ The archive includes no commercial ROMs.
 | --- | --- |
 | Wheel up / down | Joystick up / down |
 | Previous / Next buttons | Joystick left / right |
-| Centre | Fire |
-| Play | Select (console switch) |
+| Centre (hold) | Fire |
+| Play (hold) | Fire |
+| Play (short tap, <300 ms) | Select (console switch) |
 | Touch bottom strip, left to right | Select, Reset, Color/BW, Difficulty |
 | Return | Back to the ROM picker (exits the game) |
+
+A playable 6502 test ROM is included in the repo
+(`tools/make-play-rom.py`, an original 4K game: move the ship with
+the wheel, fire with Centre, Select toggles the background and the
+enemy speed). It is verified in the Q2 Pod 1.9.0 emulator
+(`tools/test-playable.py`): wheel direction, fire, Select, animation
+and a second ROM launch all pass; the emulator log shows the audio
+centred with no clipping (220832 samples, min −8220, max 16320,
+mean 12 for the playtest run).
 
 Paddle, driving-controller, keypad and Genesis-controller games load, but
 their special controls are not mapped yet. See "Known gaps".
